@@ -6,11 +6,13 @@
 
 import argparse
 import os
+from typing import List
 
 from extract_utils.args import DOWNLOAD_DIR_ENV_KEY
 from extract_utils.extract import ExtractCtx, ExtractFn, extract_fns_type
 from extract_utils.extract_misc import ExtractRenameSuperToExtVolumeName
 from extract_utils.extract_pixel import (
+    copy_pixel_firmware,
     extract_pixel_factory_image,
     extract_pixel_firmware,
     pixel_factory_image_regex,
@@ -21,6 +23,7 @@ from extract_utils.extract_star import (
     star_firmware_regex,
 )
 from extract_utils.extract_super_retrofit import ExtractSuperRetrofit
+from extract_utils.file import File
 from extract_utils.main import create_source
 from extract_utils.source import SourceCtx
 
@@ -82,18 +85,32 @@ parser.add_argument(
     help='Rename super_*.img images to their volume name',
 )
 parser.add_argument(
+    '--keep-images',
+    action='store_true',
+    help='keep the extracted partition images in the dump directory, so it '
+    'can be used as the base of a later incremental extraction',
+)
+parser.add_argument(
+    '--firmware',
+    help='path to a proprietary-firmware.txt-style file mapping firmware '
+    'source files to partition images, so firmware partitions can be updated '
+    'by incremental OTAs',
+)
+parser.add_argument(
     '--download-dir',
     help='path to directory into which to store downloads',
 )
 parser.add_argument(
     '--download-sha256',
-    help='SHA256 of the download',
+    action='append',
+    help='SHA256 of a download, pass once per downloaded source, in order',
 )
 
 parser.add_argument(
     'source',
-    help='sources from which to extract',
-    nargs='?',
+    help='source to extract from; when multiple are given, the first one is '
+    'the dump to apply the following incremental OTAs over, in order',
+    nargs='+',
 )
 
 if __name__ == '__main__':
@@ -119,7 +136,13 @@ if __name__ == '__main__':
     if args.pixel_firmware:
         for extract_pattern in args.pixel_firmware:
             extract_fns.append(
-                ExtractFn(extract_pattern, extract_pixel_firmware)
+                ExtractFn(
+                    extract_pattern,
+                    path_fns=[
+                        copy_pixel_firmware,
+                        extract_pixel_firmware,
+                    ],
+                )
             )
 
     if args.star_firmware:
@@ -143,10 +166,19 @@ if __name__ == '__main__':
     if args.extra_partitions is not None:
         extract_partitions += args.extra_partitions
 
+    firmware_files: List[File] = []
+    if args.firmware:
+        with open(args.firmware, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    firmware_files.append(File(line))
+
     extract_ctx = ExtractCtx(
         extract_partitions=extract_partitions,
         extract_fns=extract_fns,
-        extract_all=args.all,
+        firmware_files=firmware_files,
+        keep_images=args.keep_images,
     )
 
     source_ctx = SourceCtx(
@@ -156,5 +188,5 @@ if __name__ == '__main__':
         args.download_sha256,
     )
 
-    with create_source(source_ctx, extract_ctx) as source:
+    with create_source(source_ctx, extract_ctx):
         pass

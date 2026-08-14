@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import tarfile
-from concurrent.futures import ProcessPoolExecutor
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from os import path
 from tarfile import is_tarfile
 from typing import Callable, Dict, Iterable, List, Optional, Set, Union
@@ -17,6 +18,7 @@ from zipfile import ZipFile, is_zipfile
 
 from extract_utils.ext4 import EXT4_MAGIC, EXT4_MAGIC_OFFSET
 from extract_utils.extract_moto_piv import MOTO_PIV_MAGIC, extract_moto_piv
+from extract_utils.extract_recovery import extract_recovery_partition
 from extract_utils.file import File
 from extract_utils.lp import LpImage
 from extract_utils.sparse_img import SPARSE_HEADER_MAGIC, unsparse_images
@@ -25,7 +27,13 @@ from extract_utils.tools import (
     ota_extractor_path,
     sdat2img_path,
 )
-from extract_utils.utils import Color, color_print, run_cmd, scan_tree
+from extract_utils.utils import (
+    Color,
+    color_print,
+    find_file,
+    find_files,
+    run_cmd,
+)
 
 ALTERNATE_PARTITION_PATH_MAP = {
     'product': 'system/product',
@@ -42,6 +50,7 @@ SPARSE_CHUNK_SUFFIX = '_sparsechunk'
 PAYLOAD_BIN_FILE_NAME = 'payload.bin'
 SUPER_PARTITION_NAME = 'super'
 SUPER_IMG_NAME = 'super.img'
+APPLIED_INCREMENTALS_FILE_NAME = '.applied_incrementals'
 
 
 extract_fn_type = Callable[['ExtractCtx', str, str], Optional[str]]
@@ -79,7 +88,8 @@ class ExtractCtx:
         extract_partitions: Optional[List[str]] = None,
         firmware_files: Optional[List[File]] = None,
         factory_files: Optional[List[File]] = None,
-        extract_all: bool = False,
+        keep_images: bool = False,
+        images_only: bool = False,
     ):
         if extract_fns is None:
             extract_fns = []
@@ -99,77 +109,12 @@ class ExtractCtx:
         # Files are extracted if their name matches as-is
         self.firmware_files = firmware_files
         self.factory_files = factory_files
-
-        self.extract_all = extract_all
-
-
-def file_name_to_partition(file_name: str):
-    return file_name.split('.', 1)[0]
-
-
-def find_files(
-    input_path: str,
-    partition: Optional[str] = None,
-    name: Optional[str] = None,
-    regex: Optional[str] = None,
-    magic: Optional[bytes] = None,
-    position: int = 0,
-    ext: Optional[str] = None,
-) -> List[str]:
-    file_paths: List[str] = []
-    for file in scan_tree(input_path):
-        if not file.is_file():
-            continue
-
-        file_partition_name = file_name_to_partition(file.name)
-        if partition is not None and partition != file_partition_name:
-            continue
-
-        if name is not None and name != file.name:
-            continue
-
-        if regex is not None and re.match(regex, file.name) is None:
-            continue
-
-        if ext is not None and not file.name.endswith(ext):
-            continue
-
-        if magic is not None:
-            with open(file, 'rb') as f:
-                f.seek(position)
-                file_magic = f.read(len(magic))
-                if file_magic != magic:
-                    continue
-
-        file_paths.append(file.path)
-
-    return file_paths
-
-
-def find_file(
-    input_path: str,
-    partition: Optional[str] = None,
-    name: Optional[str] = None,
-    regex: Optional[str] = None,
-    magic: Optional[bytes] = None,
-    position: int = 0,
-    ext: Optional[str] = None,
-):
-    file_paths = find_files(
-        input_path,
-        partition=partition,
-        name=name,
-        regex=regex,
-        magic=magic,
-        position=position,
-        ext=ext,
-    )
-
-    assert len(file_paths) <= 1
-    if file_paths:
-        return file_paths[0]
-
-    return None
+        # Keep the extracted partition images so the dump can be used as the
+        # base of a later incremental extraction
+        self.keep_images = keep_images
+        # Stop at the partition images instead of unpacking them, for a dump
+        # that is only used as the base of an incremental extraction
+        self.images_only = images_only
 
 
 def find_alternate_partitions(
@@ -266,26 +211,36 @@ def remove_file_path(file_path: str):
     remove_file_paths([file_path])
 
 
-def extract_payload_bin(partition: str, file_path: str, output_dir: str):
-    # TODO: switch to python extractor to be able to detect partition
-    # names to make this process fatal on failure
-
+def extract_payload_bin(
+    partition: str,
+    file_path: str,
+    output_dir: str,
+    input_dir: Optional[str] = None,
+) -> bool:
     print(f'Extracting {partition}')
 
+    cmd = [
+        ota_extractor_path,
+        '--payload',
+        file_path,
+        '--output-dir',
+        output_dir,
+        '--partitions',
+        partition,
+    ]
+
+    # Base images to apply the delta on top of for incremental OTAs
+    if input_dir is not None:
+        cmd += ['--input-dir', input_dir]
+
     try:
-        run_cmd(
-            [
-                ota_extractor_path,
-                '--payload',
-                file_path,
-                '--output-dir',
-                output_dir,
-                '--partitions',
-                partition,
-            ],
-        )
+        run_cmd(cmd)
     except ValueError:
-        pass
+        # ota_extractor exits successfully and produces nothing for partitions
+        # it does not know about, a failure is a real one
+        return False
+
+    return True
 
 
 def partition_chunk_index(file_path: str):
@@ -399,24 +354,19 @@ def extract_ext4(file_path: str, output_path: str):
     # TODO: check for symlinks like the old code?
 
 
-def unzip_file(source: str, file_path: str, output_file_path: str):
-    with ZipFile(source) as zip_file:
-        with zip_file.open(file_path) as z:
-            with open(output_file_path, 'wb') as f:
-                shutil.copyfileobj(z, f)
-
-
 def extract_zip(source: str, dump_dir: str):
     with ZipFile(source) as zip_file:
-        file_paths = zip_file.namelist()
+        for info in zip_file.infolist():
+            if info.is_dir():
+                continue
 
-    with ProcessPoolExecutor() as exe:
-        for file_path in file_paths:
-            output_file_path = path.join(dump_dir, file_path)
+            output_file_path = path.join(dump_dir, info.filename)
             output_dir = path.dirname(output_file_path)
             os.makedirs(output_dir, exist_ok=True)
 
-            exe.submit(unzip_file, source, file_path, output_file_path)
+            with zip_file.open(info) as z:
+                with open(output_file_path, 'wb') as f:
+                    shutil.copyfileobj(z, f)
 
 
 def extract_tar(source: str, dump_dir: str):
@@ -451,7 +401,7 @@ def extract_firmware_partition(partition: str, dump_dir: str):
         extract_payload_bin(partition, payload_bin_path, dump_dir)
 
 
-def extract_partition(partition: str, dump_dir: str):
+def extract_partition(partition: str, dump_dir: str, ctx: ExtractCtx):
     payload_bin_path = find_payload_path(PAYLOAD_BIN_FILE_NAME, dump_dir)
     if payload_bin_path:
         extract_payload_bin(partition, payload_bin_path, dump_dir)
@@ -484,25 +434,44 @@ def extract_partition(partition: str, dump_dir: str):
         extract_sparse_data_img(sparse_data_path, dump_dir)
         remove_file_path(sparse_data_path)
 
+    if ctx.images_only:
+        return
+
     erofs_path = find_erofs_path(partition, dump_dir)
     if erofs_path:
         print_file_path(erofs_path, 'EROFS')
         extract_erofs(erofs_path, dump_dir)
-        remove_file_path(erofs_path)
+        if not ctx.keep_images:
+            remove_file_path(erofs_path)
 
     ext4_path = find_ext4_path(partition, dump_dir)
     if ext4_path:
         print_file_path(ext4_path, 'EXT4')
         extract_ext4(ext4_path, dump_dir)
-        remove_file_path(ext4_path)
+        if not ctx.keep_images:
+            remove_file_path(ext4_path)
+
+
+def find_partition_image_path(partition: str, dump_dir: str):
+    return find_erofs_path(partition, dump_dir) or find_ext4_path(
+        partition, dump_dir
+    )
 
 
 def find_partitions(dump_dir: str, ctx: ExtractCtx, missing: bool = False):
     partitions: List[str] = []
     for partition in ctx.extract_partitions:
-        dump_partition_dir = path.join(dump_dir, partition)
+        if ctx.images_only:
+            # Nothing is unpacked, a partition is done once its image is there
+            exists = find_partition_image_path(partition, dump_dir) is not None
+        else:
+            dump_partition_dir = path.join(dump_dir, partition)
+            exists = (
+                path.isdir(dump_partition_dir)
+                and len(os.listdir(dump_partition_dir)) != 0
+            )
 
-        if path.isdir(dump_partition_dir) != missing:
+        if exists != missing:
             partitions.append(partition)
 
     return partitions
@@ -529,13 +498,7 @@ def find_factory_files(dump_dir: str, ctx: ExtractCtx, missing: bool = False):
     return _find_files(dump_dir, ctx.factory_files, missing)
 
 
-def find_firmware_partitions(
-    dump_dir: str,
-    ctx: ExtractCtx,
-    missing: bool = False,
-):
-    files = find_firmware_files(dump_dir, ctx, missing)
-
+def files_partitions(files: List[File]):
     partitions: List[str] = []
     for file in files:
         partition, _ = path.splitext(file.dst)
@@ -544,20 +507,32 @@ def find_firmware_partitions(
     return partitions
 
 
+def find_firmware_partitions(
+    dump_dir: str,
+    ctx: ExtractCtx,
+    missing: bool = False,
+):
+    files = find_firmware_files(dump_dir, ctx, missing)
+
+    return files_partitions(files)
+
+
 def extract_all_partitions(dump_dir: str, ctx: ExtractCtx):
     normal_partitions = find_partitions(dump_dir, ctx, missing=True)
     firmware_partitions = find_firmware_partitions(dump_dir, ctx, missing=True)
     partitions = normal_partitions + firmware_partitions
 
     while partitions:
-        with ProcessPoolExecutor() as exe:
-            for partition in partitions:
-                if partition in firmware_partitions:
-                    fn = extract_firmware_partition
+        for partition in partitions:
+            try:
+                if partition == 'recovery':
+                    extract_recovery_partition(partition, dump_dir)
+                elif partition in firmware_partitions:
+                    extract_firmware_partition(partition, dump_dir)
                 else:
-                    fn = extract_partition
-
-                exe.submit(fn, partition, dump_dir)
+                    extract_partition(partition, dump_dir, ctx)
+            except Exception as e:
+                print(f'Warning: Failed to extract partition {partition}: {e}')
 
         found_partitions = find_partitions(dump_dir, ctx)
         partitions = find_alternate_partitions(partitions, found_partitions)
@@ -608,13 +583,217 @@ def extract_dump(dump_dir: str, ctx: ExtractCtx):
     create_empty_partition_dirs(dump_dir, ctx)
 
 
+def seed_input_dir_images(dump_dir: str, input_dir: str):
+    # Seed the dump with the previous images so that everything left unchanged
+    # by the incrementals carries over, an incremental only carries the
+    # partitions it changes. Copy every file, firmware images are not
+    # necessarily named after a partition.
+    for file_name in sorted(os.listdir(input_dir)):
+        input_file_path = path.join(input_dir, file_name)
+        # Extracted partitions are directories, their images are copied instead
+        if not path.isfile(input_file_path):
+            continue
+
+        # Skip the containers the images were extracted from, they are the
+        # only ones the extraction leaves behind and they would be extracted
+        # again over the images produced by the incrementals, and skip the
+        # marker so that the incrementals of the input dir are not taken as
+        # applied
+        if file_name in (
+            SUPER_IMG_NAME,
+            PAYLOAD_BIN_FILE_NAME,
+            APPLIED_INCREMENTALS_FILE_NAME,
+        ):
+            continue
+
+        dump_file_path = path.join(dump_dir, file_name)
+        if path.exists(dump_file_path):
+            continue
+
+        # Skip partitions which have already been unpacked, their image
+        # would never be used and never be removed
+        partition, _ = path.splitext(file_name)
+        partition_dir = path.join(dump_dir, partition)
+        if path.isdir(partition_dir) and os.listdir(partition_dir):
+            continue
+
+        print(f'Seeding {file_name} from input dir')
+        shutil.copy(input_file_path, dump_file_path)
+
+
+def is_sparse_image(file_path: str) -> bool:
+    with open(file_path, 'rb') as f:
+        return f.read(4) == SPARSE_HEADER_MAGIC.to_bytes(4, 'little')
+
+
+def reconstruct_firmware_images(dump_dir: str, firmware_files: List[File]):
+    for file in firmware_files:
+        src_path = path.join(dump_dir, file.src)
+        if not path.isfile(src_path):
+            continue
+
+        dst_name = path.basename(file.dst)
+        dst_path = path.join(dump_dir, dst_name)
+        if path.abspath(src_path) == path.abspath(dst_path):
+            continue
+
+        if is_sparse_image(src_path):
+            print(f'Expanding firmware {file.src} to {dst_name}')
+            unsparse_images([src_path], dst_path)
+            remove_file_path(src_path)
+        else:
+            print(f'Renaming firmware {file.src} to {dst_name}')
+            shutil.move(src_path, dst_path)
+
+
+def read_applied_incrementals(output_dir: str) -> List[str]:
+    file_path = path.join(output_dir, APPLIED_INCREMENTALS_FILE_NAME)
+    if not path.isfile(file_path):
+        return []
+
+    with open(file_path, 'r') as f:
+        return f.read().splitlines()
+
+
+def add_applied_incremental(output_dir: str, source_name: str):
+    file_path = path.join(output_dir, APPLIED_INCREMENTALS_FILE_NAME)
+    with open(file_path, 'a') as f:
+        f.write(f'{source_name}\n')
+
+
+def find_dir_payload_path(payload_dir: str, source: str):
+    payload_bin_path = find_payload_path(PAYLOAD_BIN_FILE_NAME, payload_dir)
+    if payload_bin_path is None:
+        raise ValueError(f'No payload.bin found in {source}')
+
+    return payload_bin_path
+
+
+@contextmanager
+def create_payload(source: str, temp_dir: str):
+    # An already extracted incremental can be used as-is
+    if path.isdir(source):
+        yield find_dir_payload_path(source, source)
+        return
+
+    with tempfile.TemporaryDirectory(dir=temp_dir) as payload_dir:
+        extract_image_file(source, payload_dir)
+        yield find_dir_payload_path(payload_dir, source)
+
+
+def apply_incremental(
+    source: str,
+    input_dir: str,
+    output_dir: str,
+):
+    # Keep the temporary directories on the same filesystem as the output dir,
+    # the produced images are multiple gigabytes and moving them is then a
+    # rename instead of a copy
+    temp_dir = path.dirname(path.abspath(output_dir))
+
+    with (
+        create_payload(source, temp_dir) as payload_path,
+        tempfile.TemporaryDirectory(dir=temp_dir) as image_dir,
+    ):
+        partitions = [
+            path.splitext(image)[0]
+            for image in sorted(os.listdir(input_dir))
+            if image.endswith('.img')
+        ]
+
+        # ota_extractor cannot safely read and write the same directory.
+        # Apply the delta with the current images as read-only input and a
+        # separate output, then overlay the produced images. The partitions
+        # are independent, apply them in parallel, one ota_extractor each.
+        with ThreadPoolExecutor() as executor:
+            futures = {
+                partition: executor.submit(
+                    extract_payload_bin,
+                    partition,
+                    payload_path,
+                    image_dir,
+                    input_dir,
+                )
+                for partition in partitions
+            }
+
+        source_name = path.basename(source)
+        image_names: List[str] = []
+
+        for partition, future in futures.items():
+            # ota_extractor fails when the previous images are not the ones
+            # the delta was built against, leaving a truncated image behind
+            if not future.result():
+                raise ValueError(
+                    f'Failed to apply {source_name} to {partition}, the '
+                    'previous images might not be the ones it was built for'
+                )
+
+            image_name = f'{partition}.img'
+            image_path = path.join(image_dir, image_name)
+
+            if not path.isfile(image_path):
+                print(f'{partition} not part of {source_name}')
+                continue
+
+            # Never replace a good image with a truncated one
+            if not path.getsize(image_path):
+                raise ValueError(f'Empty {partition} image in {source_name}')
+
+            image_names.append(image_name)
+
+        for image_name in image_names:
+            shutil.move(
+                path.join(image_dir, image_name),
+                path.join(output_dir, image_name),
+            )
+
+
+def apply_incremental_chain(
+    sources: List[str],
+    input_dir: str,
+    output_dir: str,
+):
+    # Produce the images of the last incremental, unpacking them is left to
+    # the regular dump extraction, which is then oblivious to the deltas
+    os.makedirs(output_dir, exist_ok=True)
+
+    applied = read_applied_incrementals(output_dir)
+
+    # Apply each incremental in order, without unpacking
+    for source in sources:
+        source_name = path.basename(source)
+
+        if source_name in applied:
+            print(f'Skipping already applied incremental {source_name}')
+            continue
+
+        if applied:
+            # The images of the previously applied incrementals are the input
+            # of this one, together with the ones they did not produce
+            seed_input_dir_images(output_dir, input_dir)
+            source_input_dir = output_dir
+        else:
+            # Nothing was applied yet, read the previous images where they
+            # already are instead of copying gigabytes of them first
+            source_input_dir = input_dir
+
+        print(f'Applying incremental {source_name}')
+        apply_incremental(source, source_input_dir, output_dir)
+        add_applied_incremental(output_dir, source_name)
+        applied.append(source_name)
+
+    # Carry over everything the incrementals did not produce
+    seed_input_dir_images(output_dir, input_dir)
+
+
 def create_empty_partition_dirs(dump_dir: str, ctx: ExtractCtx):
     missing_partitions = find_partitions(dump_dir, ctx, missing=True)
     for partition in missing_partitions:
         dump_partition_dir = path.join(dump_dir, partition)
         color_print(f'Partition {partition} not extracted', color=Color.YELLOW)
         # Create empty partition dir to prevent re-extraction
-        os.mkdir(dump_partition_dir)
+        os.makedirs(dump_partition_dir, exist_ok=True)
 
 
 def convert_dict_extract_fns(dict_extract_fns: extract_fns_dict_type):
